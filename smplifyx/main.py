@@ -22,11 +22,14 @@ from __future__ import division
 import sys
 import os
 
+import pickle
 import os.path as osp
 
 import time
 import yaml
 import torch
+
+from collections import defaultdict
 
 import smplx
 
@@ -37,6 +40,7 @@ from fit_single_frame import fit_single_frame
 
 from camera import create_camera
 from prior import create_prior
+import numpy as np
 
 torch.backends.cudnn.enabled = False
 
@@ -45,8 +49,8 @@ def main(**args):
     output_folder = args.pop('output_folder')
     output_folder = osp.expandvars(output_folder)
     if not osp.exists(output_folder):
-        os.makedirs(output_folder)
-
+        os.makedirs(output_folder)    
+    
     # Store the arguments for the current experiment
     conf_fn = osp.join(output_folder, 'conf.yaml')
     with open(conf_fn, 'w') as conf_file:
@@ -79,9 +83,35 @@ def main(**args):
     if use_cuda and not torch.cuda.is_available():
         print('CUDA is not available, exiting!')
         sys.exit(-1)
+    
+    data_folder = args.get('data_folder')
+    # go to parent
+    intr_file = osp.join(data_folder, 'intrinsics.yaml')
+    extr_file = osp.join(data_folder, 'extrinsics.yaml')
+    def load_matrices_from_yaml(file_path):
+        matrices = []
+        with open(file_path, 'r') as f:
+            content = f.read().strip()
+            matrix_strings = content.split('\n\n')
+            for matrix_str in matrix_strings:
+                matrix = np.loadtxt(matrix_str.splitlines(), delimiter=',')
+                matrices.append(matrix)
+        return matrices
+
+    intr = load_matrices_from_yaml(intr_file)
+    extr = load_matrices_from_yaml(extr_file)
+    
+    
+    print("Hi")
 
     img_folder = args.pop('img_folder', 'images')
-    dataset_obj = create_dataset(img_folder=img_folder, **args)
+    dataset_obj = create_dataset(data_folder=args['data_folder'], **args)
+
+
+    multi_view_data = defaultdict(list)
+    for data_item in dataset_obj:
+        frame_name = osp.basename(data_item['img_path']).split('.')[0]
+        multi_view_data[frame_name].append(data_item)
 
     start = time.time()
 
@@ -198,41 +228,88 @@ def main(**args):
     # Add a fake batch dimension for broadcasting
     joint_weights.unsqueeze_(dim=0)
 
-    for idx, data in enumerate(dataset_obj):
+    for frame_name, views in multi_view_data.items():
+        cameras = []
+        imgs = []
+        keypoints = []
 
-        img = data['img']
-        fn = data['fn']
-        keypoints = data['keypoints']
-        print('Processing: {}'.format(data['img_path']))
+        for i, view in enumerate(views):
+            # Extract intrinsic and extrinsic matrices for this camera
+            intrinsic = intr[i]  # Shape (3, 3)
+            extrinsic = extr[i]  # Shape (4, 4)
+
+            # Parse intrinsics
+            focal_length_x = intrinsic[0, 0]
+            focal_length_y = intrinsic[1, 1]
+            center = torch.tensor([intrinsic[0, 2], intrinsic[1, 2]], dtype=dtype)
+
+            # Parse extrinsics
+            rotation = torch.tensor(extrinsic[:3, :3], dtype=dtype)
+            translation = torch.tensor(extrinsic[:3, 3], dtype=dtype)
+
+            # Create a camera model for this view
+            camera = create_camera(
+                focal_length_x=focal_length_x,
+                focal_length_y=focal_length_y,
+                center=center.unsqueeze(0),  # Add batch dimension
+                rotation=rotation.unsqueeze(0),  # Add batch dimension
+                translation=translation.unsqueeze(0),  # Add batch dimension
+                batch_size=1,
+                dtype=dtype
+            )
+            cameras.append(camera)
+
+            # Append image and keypoints for this view
+            imgs.append(view['img'])
+            keypoints.append(view['keypoints'])
+
+        fn = frame_name  # Use the frame name as a unique identifier for all views
 
         curr_result_folder = osp.join(result_folder, fn)
         if not osp.exists(curr_result_folder):
             os.makedirs(curr_result_folder)
+
         curr_mesh_folder = osp.join(mesh_folder, fn)
         if not osp.exists(curr_mesh_folder):
             os.makedirs(curr_mesh_folder)
-        for person_id in range(keypoints.shape[0]):
-            if person_id >= max_persons and max_persons > 0:
-                continue
+        
+        # Step 1: Group data by personId
+        persons_data = defaultdict(list)  # Key: personId, Value: list of views for the person
 
-            curr_result_fn = osp.join(curr_result_folder,
-                                      '{:03d}.pkl'.format(person_id))
-            curr_mesh_fn = osp.join(curr_mesh_folder,
-                                    '{:03d}.obj'.format(person_id))
+        for view_idx, (view_img, view_keypoints, view_camera) in enumerate(zip(imgs, keypoints, cameras)):
+            for person_idx, person_keypoints in enumerate(view_keypoints):
+                # Extract personId for the current detection
+                person_id = view_keypoints[person_idx]['personId']
 
-            curr_img_folder = osp.join(output_folder, 'images', fn,
-                                       '{:03d}'.format(person_id))
+                # Add this view's data for the person
+                persons_data[person_id].append({
+                    'img': view_img,
+                    'keypoints': person_keypoints,
+                    'camera': view_camera,
+                })
+
+        # Step 2: Process each personId
+        for person_id, views_data in persons_data.items():
+            # Result and mesh filenames for the current person
+            curr_result_fn = osp.join(curr_result_folder, f'{person_id:03d}.pkl')
+            curr_mesh_fn = osp.join(curr_mesh_folder, f'{person_id:03d}.obj')
+
+            # Image folder for storing outputs
+            curr_img_folder = osp.join(output_folder, 'images', fn, f'{person_id:03d}')
             if not osp.exists(curr_img_folder):
                 os.makedirs(curr_img_folder)
 
+            # Determine gender (use the first view's data as reference)
+            first_view = views_data[0]
             if gender_lbl_type != 'none':
-                if gender_lbl_type == 'pd' and 'gender_pd' in data:
-                    gender = data['gender_pd'][person_id]
-                if gender_lbl_type == 'gt' and 'gender_gt' in data:
-                    gender = data['gender_gt'][person_id]
+                if gender_lbl_type == 'pd' and 'gender_pd' in first_view:
+                    gender = first_view['gender_pd']
+                elif gender_lbl_type == 'gt' and 'gender_gt' in first_view:
+                    gender = first_view['gender_gt']
             else:
                 gender = input_gender
 
+            # Select body model based on gender
             if gender == 'neutral':
                 body_model = neutral_model
             elif gender == 'female':
@@ -240,26 +317,36 @@ def main(**args):
             elif gender == 'male':
                 body_model = male_model
 
+            # Collect data for all views for this person
+            person_imgs = [data['img'] for data in views_data]
+            person_keypoints = [data['keypoints'] for data in views_data]
+            person_cameras = [data['camera'] for data in views_data]
+
+            # Define the output image path for this person
             out_img_fn = osp.join(curr_img_folder, 'output.png')
 
-            fit_single_frame(img, keypoints[[person_id]],
-                             body_model=body_model,
-                             camera=camera,
-                             joint_weights=joint_weights,
-                             dtype=dtype,
-                             output_folder=output_folder,
-                             result_folder=curr_result_folder,
-                             out_img_fn=out_img_fn,
-                             result_fn=curr_result_fn,
-                             mesh_fn=curr_mesh_fn,
-                             shape_prior=shape_prior,
-                             expr_prior=expr_prior,
-                             body_pose_prior=body_pose_prior,
-                             left_hand_prior=left_hand_prior,
-                             right_hand_prior=right_hand_prior,
-                             jaw_prior=jaw_prior,
-                             angle_prior=angle_prior,
-                             **args)
+            # Call the fitting function for the current person
+            fit_single_frame(
+                imgs=person_imgs,  # Images for all views
+                keypoints=person_keypoints,  # Keypoints for all views
+                body_model=body_model,
+                cameras=person_cameras,  # Camera models for all views
+                joint_weights=joint_weights,
+                dtype=dtype,
+                output_folder=output_folder,
+                result_folder=curr_result_folder,
+                out_img_fn=out_img_fn,
+                result_fn=curr_result_fn,
+                mesh_fn=curr_mesh_fn,
+                shape_prior=shape_prior,
+                expr_prior=expr_prior,
+                body_pose_prior=body_pose_prior,
+                left_hand_prior=left_hand_prior,
+                right_hand_prior=right_hand_prior,
+                jaw_prior=jaw_prior,
+                angle_prior=angle_prior,
+                **args
+            )
 
     elapsed = time.time() - start
     time_msg = time.strftime('%H hours, %M minutes, %S seconds',

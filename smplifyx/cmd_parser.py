@@ -33,7 +33,6 @@ def parse_config(argv=None):
                                       config_file_parser_class=cfg_parser,
                                       description=description,
                                       prog='SMPLifyX')
-
     parser.add_argument('--data_folder',
                         default=os.getcwd(),
                         help='The directory that contains the data.')

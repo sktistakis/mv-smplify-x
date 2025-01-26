@@ -132,13 +132,35 @@ class OpenPose(Dataset):
         self.img_folder = osp.join(data_folder, img_folder)
         self.keyp_folder = osp.join(data_folder, keyp_folder)
 
-        self.img_paths = [osp.join(self.img_folder, img_fn)
-                          for img_fn in os.listdir(self.img_folder)
-                          if img_fn.endswith('.png') or
-                          img_fn.endswith('.jpg') and
-                          not img_fn.startswith('.')]
-        self.img_paths = sorted(self.img_paths)
+        # Parse camera subfolders (e.g., camera0, camera1, etc.)
+        self.camera_folders = sorted([
+            folder for folder in os.listdir(self.img_folder)
+            if osp.isdir(osp.join(self.img_folder, folder))
+        ])
+
         self.cnt = 0
+        
+        self.data = []  # Collect data paths for all cameras
+        for camera in self.camera_folders:
+            img_camera_folder = osp.join(self.img_folder, camera)
+            keyp_camera_folder = osp.join(self.keyp_folder, camera)
+
+            img_paths = sorted([
+                osp.join(img_camera_folder, img_fn)
+                for img_fn in os.listdir(img_camera_folder)
+                if img_fn.endswith(('.png', '.jpg')) and not img_fn.startswith('.')
+            ])
+
+            for img_path in img_paths:
+                img_name = osp.splitext(osp.basename(img_path))[0]
+                keyp_path = osp.join(keyp_camera_folder, img_name + '_keypoints.json')
+
+                self.data.append({
+                    'camera': camera,
+                    'img_path': img_path,
+                    'keyp_path': keyp_path
+                })
+        
 
     def get_model2data(self):
         return smpl_to_openpose(self.model_type, use_hands=self.use_hands,
@@ -167,12 +189,24 @@ class OpenPose(Dataset):
         return torch.tensor(optim_weights, dtype=self.dtype)
 
     def __len__(self):
-        return len(self.img_paths)
-
+        return len(self.data)
+    
     def __getitem__(self, idx):
-        img_path = self.img_paths[idx]
-        return self.read_item(img_path)
+        item = self.data[idx]
+        img_path = item['img_path']
+        keyp_path = item['keyp_path']
 
+        # Read image and keypoints
+        img = cv2.imread(img_path).astype(np.float32)[:, :, ::-1] / 255.0
+        keypoints = read_keypoints(keyp_path, use_hands=self.use_hands, use_face=self.use_face)
+
+        return {
+            'camera': item['camera'],
+            'img_path': img_path,
+            'img': img,
+            'keypoints': keypoints.keypoints
+        }
+        
     def read_item(self, img_path):
         img = cv2.imread(img_path).astype(np.float32)[:, :, ::-1] / 255.0
         img_fn = osp.split(img_path)[1]
@@ -206,10 +240,22 @@ class OpenPose(Dataset):
         return self.next()
 
     def next(self):
-        if self.cnt >= len(self.img_paths):
+        # Stop iteration if we reach the end of the data list
+        if self.cnt >= len(self.data):
             raise StopIteration
 
-        img_path = self.img_paths[self.cnt]
+        # Get the current item and increment the counter
+        item = self.data[self.cnt]
         self.cnt += 1
 
-        return self.read_item(img_path)
+        # Read the image and keypoints for the current view
+        img = cv2.imread(item['img_path']).astype(np.float32)[:, :, ::-1] / 255.0
+        keypoints = read_keypoints(item['keyp_path'], use_hands=self.use_hands, use_face=self.use_face)
+
+        # Return the processed item
+        return {
+            'camera': item['camera'],  # Camera folder (e.g., camera0)
+            'img_path': item['img_path'],
+            'img': img,
+            'keypoints': keypoints.keypoints
+        }
